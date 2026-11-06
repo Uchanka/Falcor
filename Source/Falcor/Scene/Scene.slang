@@ -774,12 +774,17 @@ struct Scene
         v.normalW = hitPos - sphereCenter;
         float curveRadius = length(v.normalW);
         v.curveRadius = curveRadius;
-        v.normalW /= curveRadius;
+
+        // Guard degenerate segments (zero length) and zero-radius points (strand tips), which produced NaNs.
+        float3 seg = sphereB.xyz - sphereA.xyz;
+        const float segLength = length(seg);
+        const float3 tangent = segLength > 0.f ? seg / segLength : float3(0.f, 0.f, 1.f);
+        v.normalW = curveRadius > 0.f ? v.normalW / curveRadius : perp_stark(tangent);
         v.faceNormalW = v.normalW;
 
         // Note that the tangent direction is not perpendicular to the normal direction.
         // The tangent space will be orthonormalized later when preparing ShadingData.
-        v.tangentW = float4(normalize(sphereB.xyz - sphereA.xyz), 1.f);
+        v.tangentW = float4(tangent, 1.f);
 
         // All curve segments in a strand share the same texture coordinates (i.e., determined at the root of the strand).
         v.texC = vertices[0].texCrd * (1.f - uv.x) + vertices[1].texCrd * uv.x;
@@ -805,7 +810,13 @@ struct Scene
     float3 getPrevPosWFromCurve(const GeometryInstanceID instanceID, const uint curveSegIndex, const float2 uv)
     {
         const uint v0Index = getFirstCurveVertexIndex(instanceID, curveSegIndex);
-        VertexData v = {};
+
+        // The previous-frame curve buffer only exists for animated curves (and is empty/unbound otherwise); reading
+        // past it is what crashed upstream, so fall back to the current position (no object motion) out of range.
+        uint prevCount, prevStride;
+        prevCurveVertices.GetDimensions(prevCount, prevStride);
+        if (v0Index + 1 >= prevCount)
+            return getVertexDataFromCurve(instanceID, curveSegIndex, uv).posW;
 
         float3 positions[2] = { prevCurveVertices[v0Index].position, prevCurveVertices[v0Index + 1].position };
         float radii[2] = { getCurveVertex(v0Index).radius, getCurveVertex(v0Index + 1).radius };

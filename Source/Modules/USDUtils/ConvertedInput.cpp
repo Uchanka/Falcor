@@ -331,6 +331,14 @@ ConvertedInput ConvertedInput::convertTexture(
         std::string replacedFilename = ret.texturePath;
         if (udimPos != std::string::npos)
         {
+            // Keep the resolved '<UDIM>' pattern so the converter can substitute a pre-baked atlas
+            // (see scripts/mtagr/udim_bake_atlases.py and FALCOR_UDIM_ATLAS_MANIFEST).
+            {
+                SdfLayerHandle lh(getLayerHandle(fileAttrib, UsdTimeCode::EarliestTime()));
+                ret.udimPattern = SdfComputeAssetPathRelativeToLayer(lh, ret.texturePath);
+                if (ret.udimPattern.empty())
+                    ret.udimPattern = ret.texturePath;
+            }
             ret.texturePath.replace(udimPos, 6, "1001");
             // This hoop-jumping is required because we need to resolve the given path relative to the
             // layer in which it is defined, to ensure that e.g., "../../Textures/foo.dds" resolves properly.

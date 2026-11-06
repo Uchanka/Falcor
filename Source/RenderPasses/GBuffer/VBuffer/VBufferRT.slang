@@ -94,7 +94,8 @@ struct VBufferRT
         {
             const CurveHit curveHit = hit.getCurveHit();
             v = gScene.getVertexDataFromCurve(curveHit);
-            prevPosW = v.posW;//gScene.getPrevPosWFromCurve(curveHit); <- has GPU crash
+            // Curve object motion (animated fur etc.); getPrevPosWFromCurve is bounds-checked now (upstream crashed).
+            prevPosW = gScene.getPrevPosWFromCurve(curveHit);
             instanceID = curveHit.instanceID;
         }
         else if (hit.getType() == HitType::SDFGrid)

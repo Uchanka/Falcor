@@ -500,6 +500,19 @@ float2 curveHitPosToUV(const float3 hitPos, const float4 sphereA, const float4 s
     // Build a reference frame.
     float3 fwd = sphereB.xyz - sphereA.xyz;
     float fwdLength = length(fwd);
+
+    // Degenerate (zero-length) segment: spherical coordinates around the sphere, the exact inverse of the matching
+    // branch in uvToCurveHitPos (upstream divided by fwdLength = 0 and returned NaN barycentrics).
+    if (!(fwdLength > 1e-6f * max(max(sphereA.w, sphereB.w), 1e-6f)))
+    {
+        const float3 v = hitPos - sphereA.xyz;
+        const float len = length(v);
+        if (!(len > 0.f))
+            return float2(0.5f, 0.5f);
+        const float3 d = v / len;
+        return float2(saturate(0.5f * (d.z + 1.f)), atan2(d.y, d.x) / M_2PI + 0.5f);
+    }
+
     fwd /= fwdLength;
     float3 s = perp_stark(fwd);
     float3 t = cross(fwd, s);
@@ -533,13 +546,26 @@ void uvToCurveHitPos(const float2 uv, const float4 sphereA, const float4 sphereB
     // Build a reference frame.
     float3 fwd = sphereB.xyz - sphereA.xyz;
     float fwdLength = length(fwd);
+    float phi = (uv.y - 0.5f) * M_2PI;
+
+    // Degenerate (zero-length) segment, e.g. coincident control points in an animated keyframe whose topology is
+    // kept fixed: it is just the larger end sphere. Upstream divided by fwdLength here and produced NaNs.
+    const float maxRadius = max(sphereA.w, sphereB.w);
+    if (!(fwdLength > 1e-6f * max(maxRadius, 1e-6f)))
+    {
+        sphereCenter = sphereA.xyz;
+        const float cosTheta = clamp(2.f * uv.x - 1.f, -1.f, 1.f);
+        const float sinTheta = sqrt(max(1.f - cosTheta * cosTheta, 0.f));
+        hitPos = sphereCenter + maxRadius * float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        return;
+    }
+
     fwd /= fwdLength;
     float3 s = perp_stark(fwd);
     float3 t = cross(fwd, s);
 
     // Remapping.
     float z = uv.x * (sphereA.w + sphereB.w + fwdLength) - sphereA.w;
-    float phi = (uv.y - 0.5f) * M_2PI;
 
     float p1, z1, p2, z2;
     float radius;

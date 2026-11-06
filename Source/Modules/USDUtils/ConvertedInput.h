@@ -118,7 +118,9 @@ struct ConvertedInput
     float4 uniformValue = float4(0.f, 0.f, 0.f, 0.f);         ///< Uniform value, may only hold a single valid component for
                                                               ///< a float, and so on.
     std::string texturePath;                                  ///< Path to texture file.
-    Falcor::Transform texTransform;                           ///< 2D transformation applied to texture coordinates
+    std::string udimPattern;                                  ///< Absolute '<UDIM>' file pattern if the input is a UDIM set
+                                                              ///< (texturePath then holds tile 1001); used for atlas lookup.
+    Falcor::Transform texTransform;                          ///< 2D transformation applied to texture coordinates
     float4 textureScale = float4(1.f, 1.f, 1.f, 1.f);         ///< Texture value scale; valid only for emissive component.
                                                               ///< Alpha may be specified, but is ignored.
     TextureChannelFlags channels = TextureChannelFlags::None; ///< Texture channels that hold the data.

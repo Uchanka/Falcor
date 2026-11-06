@@ -32,6 +32,14 @@
 #include "USDUtils/USDUtils.h"
 #include "USDUtils/USDHelpers.h"
 
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
 BEGIN_DISABLE_USD_WARNINGS
 #include <pxr/usd/usdGeom/xformCommonAPI.h>
 #include <pxr/usd/usdRender/tokens.h>
@@ -72,6 +80,85 @@ inline int32_t getChannelIndex(TextureChannelFlags flags)
         FALCOR_UNREACHABLE();
     }
     return -1;
+}
+
+// ---- Pre-baked UDIM atlases ---------------------------------------------------------------------------------------
+// Falcor's material slots hold one texture each, so UDIM sets are baked offline into one atlas per material
+// (scripts/mtagr/udim_bake_atlases.py). FALCOR_UDIM_ATLAS_MANIFEST lists one or more manifest.json files
+// (separated by ';'), keyed by the normalized absolute '<UDIM>' pattern of the material's first textured slot
+// in the order diffuseColor, roughness, metallic, normal, opacity.
+struct UdimAtlas
+{
+    uint32_t cols = 1, rows = 1;
+    bool alpha = false;
+    std::string base, spec, normal;
+};
+
+std::string normalizeUdimKey(const std::string& p)
+{
+    std::string s = std::filesystem::path(p).lexically_normal().generic_string();
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+const std::unordered_map<std::string, UdimAtlas>& udimAtlasManifest()
+{
+    static const std::unordered_map<std::string, UdimAtlas> manifest = []
+    {
+        std::unordered_map<std::string, UdimAtlas> m;
+        const char* env = std::getenv("FALCOR_UDIM_ATLAS_MANIFEST");
+        if (!env)
+            return m;
+        std::stringstream ss(env);
+        std::string file;
+        while (std::getline(ss, file, ';'))
+        {
+            if (file.empty())
+                continue;
+            std::ifstream f(file);
+            if (!f)
+            {
+                logWarning("FALCOR_UDIM_ATLAS_MANIFEST: cannot open '{}'.", file);
+                continue;
+            }
+            nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+            if (j.is_discarded() || !j.is_object())
+            {
+                logWarning("FALCOR_UDIM_ATLAS_MANIFEST: '{}' is not a JSON object.", file);
+                continue;
+            }
+            for (auto& [key, v] : j.items())
+            {
+                UdimAtlas a;
+                a.cols = v.value("cols", 1u);
+                a.rows = v.value("rows", 1u);
+                a.alpha = v.value("alpha", false);
+                auto str = [&](const char* k) { return v.contains(k) && v[k].is_string() ? v[k].get<std::string>() : std::string(); };
+                a.base = str("base");
+                a.spec = str("spec");
+                a.normal = str("normal");
+                m[normalizeUdimKey(key)] = a;
+            }
+            logInfo("Loaded {} UDIM atlases from '{}'.", j.size(), file);
+        }
+        return m;
+    }();
+    return manifest;
+}
+
+const UdimAtlas* findUdimAtlas(const StandardMaterialSpec& spec)
+{
+    const auto& m = udimAtlasManifest();
+    if (m.empty())
+        return nullptr;
+    for (const ConvertedInput* ci : {&spec.baseColor, &spec.roughness, &spec.metallic, &spec.normal, &spec.opacity})
+    {
+        if (ci->udimPattern.empty())
+            continue;
+        auto it = m.find(normalizeUdimKey(ci->udimPattern));
+        return it == m.end() ? nullptr : &it->second;
+    }
+    return nullptr;
 }
 } // namespace
 
@@ -520,18 +607,58 @@ ref<Material> PreviewSurfaceConverter::convert(const UsdShadeMaterial& material,
     // For now, force all materials to be double-sided.
     pMaterial->setDoubleSided(true);
 
-    ref<Texture> baseColorTexture = loadTexture(spec.baseColor);
-    ref<Texture> opacityTexture = loadTexture(spec.opacity);
-    ref<Texture> roughnessTexture = loadTexture(spec.roughness);
-    ref<Texture> metallicTexture = loadTexture(spec.metallic);
-    ref<Texture> normalTexture = loadTexture(spec.normal);
+    // UDIM materials with a pre-baked atlas: base (sRGB, opacity in alpha), packed spec and normal come from the
+    // atlas; the per-slot texture loads and runtime packing below are skipped for those slots.
+    const UdimAtlas* pAtlas = findUdimAtlas(spec);
+    ref<Texture> atlasSpecTexture;
+    bool atlasAlpha = false;
+
+    ref<Texture> baseColorTexture, opacityTexture, roughnessTexture, metallicTexture, normalTexture;
+    if (pAtlas)
+    {
+        auto loadDDS = [&](const std::string& path, bool srgb) -> ref<Texture>
+        {
+            if (path.empty())
+                return nullptr;
+            std::scoped_lock lock(mMutex);
+            ref<Texture> t = ImageIO::loadTextureFromDDS(mpDevice, path, srgb);
+            if (!t)
+                logWarning("Material '{}': failed to load UDIM atlas '{}'.", materialName, path);
+            return t;
+        };
+        baseColorTexture = loadDDS(pAtlas->base, true);
+        atlasSpecTexture = loadDDS(pAtlas->spec, false);
+        normalTexture = loadDDS(pAtlas->normal, false);
+        atlasAlpha = pAtlas->alpha && baseColorTexture;
+    }
+    else
+    {
+        baseColorTexture = loadTexture(spec.baseColor);
+        opacityTexture = loadTexture(spec.opacity);
+        roughnessTexture = loadTexture(spec.roughness);
+        metallicTexture = loadTexture(spec.metallic);
+        normalTexture = loadTexture(spec.normal);
+    }
     ref<Texture> emissionTexture = loadTexture(spec.emission);
     ref<Texture> displacementTexture = loadTexture(spec.disp);
 
     pMaterial->setIndexOfRefraction(spec.ior);
 
+    if (pAtlas)
+    {
+        if (atlasSpecTexture)
+            pMaterial->setSpecularTexture(atlasSpecTexture);
+        else
+            pMaterial->setSpecularParams(float4(0.f, spec.roughness.uniformValue.r, spec.metallic.uniformValue.r, 1.f));
+        if (atlasAlpha)
+        {
+            // Atlas alpha holds opacity; treat it as a cutout (UsdPreviewSurface's default threshold of 0 would
+            // mean transmission, which the atlas path does not reproduce).
+            pMaterial->setAlphaThreshold(spec.opacityThreshold > 0.f ? spec.opacityThreshold : 0.5f);
+        }
+    }
     // If there is either a roughness or metallic texture, convert texture(s) and constant (if any) to an ORM texture.
-    if (metallicTexture || roughnessTexture)
+    else if (metallicTexture || roughnessTexture)
     {
         ref<Texture> pSpecularTex = createSpecularTexture(spec.roughness, roughnessTexture, spec.metallic, metallicTexture, pRenderContext);
         pMaterial->setSpecularTexture(pSpecularTex);
@@ -541,7 +668,7 @@ ref<Material> PreviewSurfaceConverter::convert(const UsdShadeMaterial& material,
         pMaterial->setSpecularParams(float4(0.f, spec.roughness.uniformValue.r, spec.metallic.uniformValue.r, 1.f));
     }
 
-    if (spec.opacity.uniformValue.r < 1.f || opacityTexture)
+    if (!pAtlas && (spec.opacity.uniformValue.r < 1.f || opacityTexture))
     {
         pMaterial->setAlphaThreshold(spec.opacityThreshold);
         if (spec.opacityThreshold > 0.f)
@@ -646,6 +773,14 @@ ref<Material> PreviewSurfaceConverter::convert(const UsdShadeMaterial& material,
     {
         // Apply y-flip
         texTrans.setScaling(float3(1.f, -1.f, 1.f));
+    }
+    if (pAtlas)
+    {
+        // UDIM tile (u, v) lives in atlas cell (u, v) counted from the bottom, so atlas uv = uv / (cols, rows).
+        // Falcor's texture transform scales the *texture* (SceneBuilder applies its inverse to the coordinates),
+        // so the texture is enlarged by (cols, rows). Scaling is the last step in both branches above.
+        float3 s = texTrans.getScaling();
+        texTrans.setScaling(float3(s.x * float(pAtlas->cols), s.y * float(pAtlas->rows), s.z));
     }
     pMaterial->setTextureTransform(texTrans);
 

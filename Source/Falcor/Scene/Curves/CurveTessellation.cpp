@@ -98,16 +98,21 @@ namespace Falcor
             return std::max(w, (float)std::numeric_limits<float16_t>::min());
         }
 
-        void optimizeStrandGeometry(CubicSplineCache& splineCache, const CurveArrays& curveArrays, StrandArrays& strandArrays, StrandArrays& optimizedStrandArrays, uint32_t pointOffset, uint32_t subdivPerSegment, uint32_t keepOneEveryXVerticesPerStrand, float widthScale)
+        // Returns false for degenerate strands (< 2 distinct control points), which the caller must skip:
+        // the cubic spline setup indexes [pointCount - 2] and would read out of bounds (ALab fur has such strands).
+        bool optimizeStrandGeometry(CubicSplineCache& splineCache, const CurveArrays& curveArrays, StrandArrays& strandArrays, StrandArrays& optimizedStrandArrays, uint32_t pointOffset, uint32_t subdivPerSegment, uint32_t keepOneEveryXVerticesPerStrand, float widthScale, bool removeDuplicates = true)
         {
             strandArrays.controlPoints.clear();
             strandArrays.UVs.clear();
             strandArrays.widths.clear();
+            optimizedStrandArrays.vertexCount = 0;
+            if (strandArrays.vertexCount < 2)
+                return false;
 
             // Optimize geometry by removing duplicates.
             for (uint32_t j = 0; j < strandArrays.vertexCount - 1; j++)
             {
-                if (any(curveArrays.controlPoints[pointOffset + j] != curveArrays.controlPoints[pointOffset + j + 1]))
+                if (!removeDuplicates || any(curveArrays.controlPoints[pointOffset + j] != curveArrays.controlPoints[pointOffset + j + 1]))
                 {
                     strandArrays.controlPoints.push_back(curveArrays.controlPoints[pointOffset + j]);
                     strandArrays.widths.push_back(curveArrays.widths[pointOffset + j]);
@@ -121,6 +126,11 @@ namespace Falcor
             if (curveArrays.UVs) strandArrays.UVs.push_back(curveArrays.UVs[pointOffset + strandArrays.vertexCount - 1]);
 
             optimizedStrandArrays.vertexCount = static_cast<uint32_t>(strandArrays.controlPoints.size());
+            if (optimizedStrandArrays.vertexCount < 2)
+            {
+                optimizedStrandArrays.vertexCount = 0;
+                return false;
+            }
 
             const CubicSpline<float3>& splinePoints = splineCache.optSplinePoints.setup(strandArrays.controlPoints.data(), optimizedStrandArrays.vertexCount);
             const CubicSpline<float>& splineWidths = splineCache.optSplineWidths.setup(strandArrays.widths.data(), optimizedStrandArrays.vertexCount);
@@ -165,6 +175,7 @@ namespace Falcor
                 // Always keep the last vertex.
                 optimizedStrandArrays.UVs.push_back(splineUVs.interpolate(optimizedStrandArrays.vertexCount - 2, 1.f));
             }
+            return true;
         }
 
         void updateCurveFrame(const StrandArrays& strandArrays, float3& fwd, float3& s, float3& t, uint32_t j)
@@ -241,7 +252,7 @@ namespace Falcor
         }
     }
 
-    CurveTessellation::SweptSphereResult CurveTessellation::convertToLinearSweptSphere(uint32_t strandCount, const uint32_t* vertexCountsPerStrand, const float3* controlPoints, const float* widths, const float2* UVs, uint32_t degree, uint32_t subdivPerSegment, uint32_t keepOneEveryXStrands, uint32_t keepOneEveryXVerticesPerStrand, float widthScale, const float4x4& xform)
+    CurveTessellation::SweptSphereResult CurveTessellation::convertToLinearSweptSphere(uint32_t strandCount, const uint32_t* vertexCountsPerStrand, const float3* controlPoints, const float* widths, const float2* UVs, uint32_t degree, uint32_t subdivPerSegment, uint32_t keepOneEveryXStrands, uint32_t keepOneEveryXVerticesPerStrand, float widthScale, const float4x4& xform, bool removeDuplicatePoints)
     {
         SweptSphereResult result;
 
@@ -283,7 +294,11 @@ namespace Falcor
             optimizedStrandArrays.vertexCount = 0;
             strandArrays.vertexCount = vertexCountsPerStrand[i];
 
-            optimizeStrandGeometry(splineCache, curveArrays, strandArrays, optimizedStrandArrays, pointOffset, subdivPerSegment, keepOneEveryXVerticesPerStrand, widthScale);
+            if (!optimizeStrandGeometry(splineCache, curveArrays, strandArrays, optimizedStrandArrays, pointOffset, subdivPerSegment, keepOneEveryXVerticesPerStrand, widthScale, removeDuplicatePoints))
+            {
+                for (uint32_t j = i; j < std::min(strandCount, i + keepOneEveryXStrands); j++) pointOffset += vertexCountsPerStrand[j];
+                continue; // degenerate strand
+            }
 
             const CubicSpline<float3>& splinePoints = splineCache.splinePoints.setup(strandArrays.controlPoints.data(), optimizedStrandArrays.vertexCount);
             const CubicSpline<float>& splineWidths = splineCache.splineWidths.setup(strandArrays.widths.data(), optimizedStrandArrays.vertexCount);
@@ -382,9 +397,10 @@ namespace Falcor
 
             strandArrays.vertexCount = vertexCountsPerStrand[i];
 
-            optimizeStrandGeometry(splineCache, curveArrays, strandArrays, optimizedStrandArrays, pointOffset, subdivPerSegment, keepOneEveryXVerticesPerStrand, widthScale);
+            const bool strandOk = optimizeStrandGeometry(splineCache, curveArrays, strandArrays, optimizedStrandArrays, pointOffset, subdivPerSegment, keepOneEveryXVerticesPerStrand, widthScale);
 
             for (uint32_t j = i; j < std::min(strandCount, i + keepOneEveryXStrands); j++) pointOffset += vertexCountsPerStrand[j];
+            if (!strandOk) continue; // degenerate strand
 
             // Build the initial frame.
             float3 fwd, s, t;

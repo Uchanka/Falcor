@@ -132,6 +132,14 @@ namespace Falcor
         std::vector<SceneBuilder::ProcessedCurve> processedCurves;  ///< List of pre-processed curves per keyframe.
 
         SceneBuilder::ProcessedMesh processedMesh;                  ///< Pre-processed mesh of the first keyframe (valid only for PolyTube tessellation mode).
+
+        /// Keyframe-consistent control-point filter for animated curves (empty = no filtering).
+        /// Built from all keyframes so every keyframe tessellates to the same topology; per-keyframe duplicate
+        /// removal is then disabled.
+        std::vector<uint32_t> keptPointIndices;                     ///< Source point indices to keep, in order.
+        std::vector<uint32_t> keptVertexCounts;                     ///< Vertex count per kept strand (each >= 2).
+        uint32_t keepOneEveryXStrands = 0;                          ///< 0 = use settings; else strand decimation chosen by the GPU budget.
+        std::vector<UsdTimeCode> timeCodes;                         ///< Time codes to tessellate (filled by prepareCurve).
     };
 
     /** Represents a prototype in the scene.
@@ -246,11 +254,14 @@ namespace Falcor
         // Return a pointer to the material to use for the given UsdShadeMaterial. Thread-safe.
         ref<Material> resolveMaterial(const UsdPrim& prim, const UsdShadeMaterial& material, const std::string& primName);
 
-        // Return the UsdShadeMaterial bound to the given prim
+        // Return the UsdShadeMaterial bound to the given prim.
+        // Prefers the "full" (final-render) purpose, which USD falls back to allPurpose for when absent.
+        // Production assets (e.g. ALab) bind textured materials only for "full" and leave allPurpose
+        // unbound, so the default lookup returned nothing and meshes fell back to displayColor.
         template <class T>
         UsdShadeMaterial getBoundMaterial(const T& prim)
         {
-            return UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial(&bindingsCache, &collQueryCache);
+            return UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial(&bindingsCache, &collQueryCache, UsdShadeTokens->full);
         }
 
         // Meshes

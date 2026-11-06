@@ -225,6 +225,14 @@ namespace Falcor
             }
             if (texCoordPrimvars.size() > 0)
             {
+                // Prefer the conventional 'st' (then 'st_0'), which UsdPreviewSurface networks read via
+                // UsdPrimvarReader_float2; upstream took the first match, e.g. ALab's 'perfuv', which mis-mapped textures.
+                std::stable_sort(texCoordPrimvars.begin(), texCoordPrimvars.end(),
+                    [&](const UsdGeomPrimvar& a, const UsdGeomPrimvar& b)
+                    {
+                        auto rank = [&](const UsdGeomPrimvar& p) { return p.GetName() == stName ? 0 : p.GetName() == st_0Name ? 1 : 2; };
+                        return rank(a) < rank(b);
+                    });
                 primvar = texCoordPrimvars[0];
                 if (texCoordPrimvars.size() > 1)
                 {
@@ -591,8 +599,9 @@ namespace Falcor
             UsdAttribute extentAttr = usdCurve.GetExtentAttr();
             if (!extentAttr || !extentAttr.Get(&usdExtent, timeCode))
             {
-                logWarning("Curve '{}' has no AABB. Ignoring.", curveName);
-                return false;
+                // The extent is not used for tessellation (bounds are rebuilt from the swept spheres), so a missing
+                // one is no reason to drop the curve (upstream ignored e.g. most of ALab's procedural fur).
+                logDebug("Curve '{}' has no authored extent; continuing.", curveName);
             }
 
             UsdAttribute pointsAttr = usdCurve.GetPointsAttr();
@@ -632,11 +641,55 @@ namespace Falcor
                 uvPrimvar.ComputeFlattened(&usdUVs, timeCode);
             }
 
+            // Downstream code indexes widths/UVs per vertex (only debug-asserted). Expand constant / per-strand
+            // widths and drop UVs that are not per vertex, otherwise Release builds read out of bounds
+            // (crashes on ALab's procedural fur curves).
+            const size_t vertexCount = std::accumulate(usdCurveVertexCounts.begin(), usdCurveVertexCounts.end(), size_t(0));
+            if (vertexCount != usdPoints.size())
+            {
+                logWarning("Curve '{}' has {} points but vertex counts sum to {}. Ignoring.", curveName, usdPoints.size(), vertexCount);
+                return false;
+            }
+            // Optional cap (env FALCOR_USD_MAX_CURVE_VERTICES, 0/unset = no cap) for production fur that is too big.
+            static const size_t kMaxCurveVertices = []
+            {
+                const char* s = std::getenv("FALCOR_USD_MAX_CURVE_VERTICES");
+                return s ? size_t(std::strtoull(s, nullptr, 10)) : size_t(0);
+            }();
+            if (kMaxCurveVertices && vertexCount > kMaxCurveVertices)
+            {
+                logWarning("Curve '{}' has {} vertices (> FALCOR_USD_MAX_CURVE_VERTICES={}). Ignoring.", curveName, vertexCount, kMaxCurveVertices);
+                return false;
+            }
+            if (usdCurveWidths.size() != vertexCount)
+            {
+                VtFloatArray w(vertexCount);
+                if (usdCurveWidths.size() == usdCurveVertexCounts.size()) // uniform: one width per strand
+                {
+                    size_t v = 0;
+                    for (size_t s = 0; s < usdCurveVertexCounts.size(); ++s)
+                        for (int i = 0; i < usdCurveVertexCounts[s]; ++i)
+                            w[v++] = usdCurveWidths[s];
+                }
+                else // constant (or anything else): use the first width, default 1
+                {
+                    const float c = usdCurveWidths.empty() ? 1.f : usdCurveWidths[0];
+                    std::fill(w.begin(), w.end(), c);
+                }
+                logWarning("Curve '{}': expanded {} widths to {} vertices.", curveName, usdCurveWidths.size(), vertexCount);
+                usdCurveWidths = std::move(w);
+            }
+            if (!usdUVs.empty() && usdUVs.size() != vertexCount)
+            {
+                logWarning("Curve '{}': {} UVs for {} vertices, dropping UVs.", curveName, usdUVs.size(), vertexCount);
+                usdUVs.clear();
+            }
+
             return true;
         }
 
         // Convert a UsdGeomBasisCurves into a CurveGeomData (curve primitive).
-        bool convertToCurveGeomData(const UsdGeomBasisCurves& usdCurve, const UsdTimeCode& timeCode, ImporterContext& ctx, CurveGeomData& geomOut)
+        bool convertToCurveGeomData(const UsdGeomBasisCurves& usdCurve, const UsdTimeCode& timeCode, ImporterContext& ctx, CurveGeomData& geomOut, const Curve* pFilter = nullptr)
         {
             std::string curveName = usdCurve.GetPath().GetString();
 
@@ -647,6 +700,27 @@ namespace Falcor
             if (!extractCurveData(usdCurve, timeCode, usdPoints, usdCurveVertexCounts, usdCurveWidths, usdUVs))
             {
                 return false;
+            }
+
+            // Animated curves: apply the keyframe-consistent point filter and keep every point thereafter, so all
+            // keyframes produce identical topology (see buildCurveKeyframeFilter).
+            const bool filtered = pFilter && !pFilter->keptPointIndices.empty();
+            if (filtered)
+            {
+                const auto& idx = pFilter->keptPointIndices;
+                VtVec3fArray p(idx.size());
+                VtFloatArray w(idx.size());
+                VtVec2fArray uv(usdUVs.empty() ? 0 : idx.size());
+                for (size_t i = 0; i < idx.size(); ++i)
+                {
+                    p[i] = usdPoints[idx[i]];
+                    w[i] = usdCurveWidths[idx[i]];
+                    if (!usdUVs.empty()) uv[i] = usdUVs[idx[i]];
+                }
+                usdPoints = std::move(p);
+                usdCurveWidths = std::move(w);
+                usdUVs = std::move(uv);
+                usdCurveVertexCounts = VtIntArray(pFilter->keptVertexCounts.begin(), pFilter->keptVertexCounts.end());
             }
 
             size_t strandCount = usdCurveVertexCounts.size();
@@ -660,6 +734,8 @@ namespace Falcor
             uint32_t subdivPerSegment                = ctx.builder.getSettings().getAttribute(curveName, "curves:subdivPerSegment", kCurveSubdivPerSegment);
             uint32_t keepOneEveryXStrands            = ctx.builder.getSettings().getAttribute(curveName, "curves:keepOneEveryXStrands", kCurveKeepOneEveryXStrands);
             uint32_t keepOneEveryXVerticesPerStrand  = ctx.builder.getSettings().getAttribute(curveName, "curves:keepOneEveryXVerticesPerStrand", kCurveKeepOneEveryXVerticesPerStrand);
+            if (pFilter && pFilter->keepOneEveryXStrands > keepOneEveryXStrands)
+                keepOneEveryXStrands = pFilter->keepOneEveryXStrands;
 
             // Perceptually, it is a good practice to increase width of hair strands if we render less of them than anticipated.
             float widthScale = std::sqrt((float)keepOneEveryXStrands);
@@ -667,7 +743,24 @@ namespace Falcor
             // Convert to linear swept sphere segments.
             CurveTessellation::SweptSphereResult result = CurveTessellation::convertToLinearSweptSphere(strandCount, reinterpret_cast<const uint32_t*>(usdCurveVertexCounts.data()),
                 (float3*)usdPoints.data(), usdCurveWidths.data(), pUsdUVs, 1,
-                subdivPerSegment, keepOneEveryXStrands, keepOneEveryXVerticesPerStrand, widthScale, float4x4::identity());
+                subdivPerSegment, keepOneEveryXStrands, keepOneEveryXVerticesPerStrand, widthScale, float4x4::identity(),
+                /*removeDuplicatePoints*/ !filtered);
+
+            // Falcor's curve path uses vertex positions as world space directly (one BLAS of per-segment AABBs; the
+            // instance's node transform is never applied to curve geometry), so bake the stage-to-world transform
+            // at this keyframe's time (parents may be animated) into the points and radii. The curve instance is
+            // then added with an identity transform and no parent (see USDImporter.cpp).
+            {
+                const float4x4 xf = ctx.getLocalToWorldXform(usdCurve, timeCode);
+                const float sx = length(transformVector(xf, float3(1.f, 0.f, 0.f)));
+                const float sy = length(transformVector(xf, float3(0.f, 1.f, 0.f)));
+                const float sz = length(transformVector(xf, float3(0.f, 0.f, 1.f)));
+                const float radiusScale = std::cbrt(sx * sy * sz);
+                for (auto& p : result.points)
+                    p = transformPoint(xf, p);
+                for (auto& r : result.radius)
+                    r *= radiusScale;
+            }
 
             // Copy data.
             geomOut.id = curveName;
@@ -966,7 +1059,74 @@ namespace Falcor
             return true;
         }
 
-        bool processCurve(Curve& curve, ImporterContext& ctx)
+        // Build the keyframe-consistent point filter of an animated curve (see Curve::keptPointIndices).
+        // A point is kept if it differs from the next point of its strand in ANY keyframe (the last point of a strand
+        // is always kept); strands left with < 2 points are dropped. The strand decimation for the GPU budget is
+        // chosen globally afterwards (addCurvesToSceneBuilder).
+        // Returns false if the source topology itself changes between keyframes.
+        bool buildCurveKeyframeFilter(const UsdGeomBasisCurves& geomCurve, const std::vector<UsdTimeCode>& timeCodes, Curve& curve)
+        {
+            const std::string name = geomCurve.GetPath().GetString();
+            VtIntArray counts0;
+            std::vector<uint8_t> moves;
+            size_t n = 0;
+            for (size_t k = 0; k < timeCodes.size(); ++k)
+            {
+                VtVec3fArray pts;
+                VtIntArray counts;
+                if (!geomCurve.GetPointsAttr().Get(&pts, timeCodes[k]) || !geomCurve.GetCurveVertexCountsAttr().Get(&counts, timeCodes[k]))
+                    return false;
+                if (k == 0)
+                {
+                    counts0 = counts;
+                    n = pts.size();
+                    moves.assign(n, 0);
+                    if ((size_t)std::accumulate(counts.begin(), counts.end(), size_t(0)) != n)
+                        return false;
+                }
+                else if (pts.size() != n || counts != counts0)
+                {
+                    return false;
+                }
+                size_t off = 0;
+                for (int c : counts)
+                {
+                    for (int j = 0; j + 1 < c; ++j)
+                        if (!moves[off + j] && pts[off + j] != pts[off + j + 1])
+                            moves[off + j] = 1;
+                    off += c;
+                }
+            }
+
+            curve.keptPointIndices.clear();
+            curve.keptVertexCounts.clear();
+            size_t off = 0, dropped = 0;
+            for (int c : counts0)
+            {
+                const size_t start = curve.keptPointIndices.size();
+                for (int j = 0; j < c; ++j)
+                    if (j == c - 1 || moves[off + j])
+                        curve.keptPointIndices.push_back(uint32_t(off + j));
+                const size_t kept = curve.keptPointIndices.size() - start;
+                if (kept < 2)
+                {
+                    curve.keptPointIndices.resize(start);
+                    ++dropped;
+                }
+                else
+                {
+                    curve.keptVertexCounts.push_back(uint32_t(kept));
+                }
+                off += c;
+            }
+
+            logInfo("Curve '{}': {} keyframes, {} of {} points kept across keyframes, {} degenerate strands dropped.",
+                    name, timeCodes.size(), curve.keptPointIndices.size(), n, dropped);
+            return true;
+        }
+
+        // Phase 1 (parallel): time samples and, for animated curves, the keyframe-consistent point filter.
+        void prepareCurve(Curve& curve, ImporterContext& ctx)
         {
             UsdGeomBasisCurves geomCurve(curve.curvePrim);
             std::string primName(geomCurve.GetPath().GetString());
@@ -986,7 +1146,8 @@ namespace Falcor
             }
 
             uint32_t timeSampleCount = (uint32_t)curve.timeSamples.size();
-            std::vector<UsdTimeCode> timeCodes;
+            std::vector<UsdTimeCode>& timeCodes = curve.timeCodes;
+            timeCodes.clear();
             if (timeSampleCount == 0)
             {
                 timeCodes.push_back(UsdTimeCode::EarliestTime());
@@ -998,18 +1159,63 @@ namespace Falcor
                 for (uint32_t i = 0; i < timeSampleCount; i++) timeCodes.push_back(UsdTimeCode(curve.timeSamples[i]));
             }
 
+            // Animated curves: choose the kept points from all keyframes at once (per-keyframe duplicate removal made
+            // the topology differ between keyframes, which the scene rejects), and thin strands to a GPU budget,
+            // since every keyframe stays resident on the GPU.
+            if (timeCodes.size() > 1 && !buildCurveKeyframeFilter(geomCurve, timeCodes, curve))
+            {
+                logWarning("Curve '{}': topology changes across source keyframes; using the first keyframe only.", primName);
+                timeCodes.resize(1);
+                curve.timeSamples.resize(1);
+                curve.keptPointIndices.clear();
+                curve.keptVertexCounts.clear();
+            }
+
+        }
+
+        // Phase 2 (parallel): tessellate every keyframe (after the global strand decimation was chosen).
+        bool processCurve(Curve& curve, ImporterContext& ctx)
+        {
+            UsdGeomBasisCurves geomCurve(curve.curvePrim);
+            std::string primName(geomCurve.GetPath().GetString());
+            const std::vector<UsdTimeCode>& timeCodes = curve.timeCodes;
+
             for (size_t i = 0; i < timeCodes.size(); i++)
             {
                 CurveGeomData curveData;
-                if (!convertToCurveGeomData(geomCurve, timeCodes[i], ctx, curveData))
+                if (!convertToCurveGeomData(geomCurve, timeCodes[i], ctx, curveData, &curve))
                 {
+                    return false;
+                }
+                if (curveData.points.empty() || curveData.indices.empty())
+                {
+                    logWarning("Curve '{}' has no non-degenerate strands. Ignoring.", primName);
+                    curve.processedCurves.clear();
                     return false;
                 }
 
                 SceneBuilder::Curve sbCurve;
-                if (createSceneBuilderCurve(curve.curvePrim, curveData, ctx, sbCurve))
+                if (!createSceneBuilderCurve(curve.curvePrim, curveData, ctx, sbCurve))
                 {
-                    curve.processedCurves.push_back(ctx.builder.processCurve(sbCurve));
+                    curve.processedCurves.clear();
+                    return false;
+                }
+                curve.processedCurves.push_back(ctx.builder.processCurve(sbCurve));
+
+                if (i == 0 && std::getenv("FALCOR_USD_CURVE_DEBUG")) // optional diagnostics: world-space bounds / radii of keyframe 0
+                {
+                    float3 mn(1e30f), mx(-1e30f);
+                    float rmin = 1e30f, rmax = -1e30f;
+                    size_t bad = 0;
+                    for (const auto& v : curve.processedCurves[0].staticData)
+                    {
+                        if (!all(isfinite(v.position)) || !std::isfinite(v.radius)) { ++bad; continue; }
+                        mn = min(mn, v.position); mx = max(mx, v.position);
+                        rmin = std::min(rmin, v.radius); rmax = std::max(rmax, v.radius);
+                    }
+                    logWarning("CURVEDBG '{}': {} verts, {} segs, {} non-finite, bbox ({},{},{})-({},{},{}), radius {}..{}, keyframes {}",
+                        primName, curve.processedCurves[0].staticData.size(), curve.processedCurves[0].indexData.size(), bad,
+                        mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, rmin, rmax, timeCodes.size());
                 }
 
                 // Compute keyframe time in seconds.
@@ -1233,7 +1439,11 @@ namespace Falcor
                             auto nodeId = ctx.builder.addNode(makeNode(instName, inst.xform, float4x4::identity(), NodeID{ inst.parentID.get() + protoRootID.get() }));
                             const auto& curve = ctx.getCurve(inst.prim);
 
-                            if (curve.tessellationMode == CurveTessellationMode::LinearSweptSphere)
+                            if (!curve.geometryID.isValid())
+                            {
+                                // Curve was rejected during processing (e.g. no extent); nothing to instance.
+                            }
+                            else if (curve.tessellationMode == CurveTessellationMode::LinearSweptSphere)
                             {
                                 ctx.builder.addCurveInstance(nodeId, CurveID{ curve.geometryID });
                             }
@@ -1263,27 +1473,90 @@ namespace Falcor
         void addCurvesToSceneBuilder(ImporterContext& ctx, TimeReport& timeReport)
         {
             // Process collected curves.
+            tbb::parallel_for<size_t>(0, ctx.curves.size(), [&](size_t i) { prepareCurve(ctx.curves[i], ctx); });
+
+            // Every keyframe of an animated curve stays resident on the GPU (AnimatedVertexCache), so fit all animated
+            // curves into FALCOR_USD_CURVE_KEYFRAME_BUDGET_MB (default 2048) by water-filling: each curve may use at
+            // most `cap` bytes (strand decimation k_i = ceil(bytes_i / cap)), with the largest cap that fits. Small
+            // curves (knit/woven garments, short fur patches, where decimation shows as stripes) stay complete and only
+            // the big fur grooms are thinned.
+            {
+                const char* env = std::getenv("FALCOR_USD_CURVE_KEYFRAME_BUDGET_MB");
+                const uint64_t budget = uint64_t(env ? std::strtoull(env, nullptr, 10) : 2048ull) << 20;
+                std::vector<std::pair<size_t, uint64_t>> sizes; // (curve index, bytes)
+                uint64_t total = 0;
+                for (size_t i = 0; i < ctx.curves.size(); ++i)
+                {
+                    const auto& c = ctx.curves[i];
+                    if (c.keptPointIndices.empty())
+                        continue;
+                    const uint64_t b = uint64_t(c.keptPointIndices.size()) * sizeof(float3) * c.timeCodes.size();
+                    sizes.emplace_back(i, b);
+                    total += b;
+                }
+                auto usedWithCap = [&](uint64_t cap)
+                {
+                    uint64_t used = 0;
+                    for (auto& [i, b] : sizes)
+                        used += b / std::max<uint64_t>(1, (b + cap - 1) / cap);
+                    return used;
+                };
+                uint64_t cap = total; // no decimation if everything fits
+                if (budget && total > budget)
+                {
+                    uint64_t lo = 1, hi = total;
+                    while (lo < hi) // largest cap with usedWithCap(cap) <= budget
+                    {
+                        const uint64_t mid = lo + (hi - lo + 1) / 2;
+                        if (usedWithCap(mid) <= budget) lo = mid; else hi = mid - 1;
+                    }
+                    cap = lo;
+                }
+                uint32_t maxK = 1;
+                for (auto& [i, b] : sizes)
+                {
+                    const uint32_t k = uint32_t(std::max<uint64_t>(1, (b + cap - 1) / cap));
+                    ctx.curves[i].keepOneEveryXStrands = k;
+                    maxK = std::max(maxK, k);
+                    if (k > 1)
+                        logWarning("Curve '{}': {:.2f} GB of keyframes; keeping 1 of every {} strands.",
+                                   ctx.curves[i].curvePrim.GetPath().GetString(), b / 1e9, k);
+                }
+                if (!sizes.empty())
+                    logWarning("Animated curves: {} curves, {:.1f} GB of keyframe vertices, ~{:.1f} GB after decimation "
+                               "(FALCOR_USD_CURVE_KEYFRAME_BUDGET_MB={}, max decimation 1/{}).",
+                               sizes.size(), total / 1e9, usedWithCap(cap) / 1e9, budget >> 20, maxK);
+            }
+
+            std::vector<char> ok(ctx.curves.size(), 0);
             tbb::parallel_for<size_t>(0, ctx.curves.size(),
-                [&](size_t i) { processCurve(ctx.curves[i], ctx); }
+                [&](size_t i) { ok[i] = processCurve(ctx.curves[i], ctx) ? 1 : 0; }
             );
 
             // Add processed curves or meshes (of the first keyframe) to scene builder.
             // This is done sequentially after being processed in parallel to ensure a deterministic ordering.
-            for (auto& curve : ctx.curves)
+            // Curves rejected during processing keep an invalid geometryID and are skipped everywhere below
+            // (upstream indexed processedCurves[0] unconditionally -> Release crash on ALab).
+            size_t skipped = 0;
+            for (size_t i = 0; i < ctx.curves.size(); ++i)
             {
+                auto& curve = ctx.curves[i];
                 if (curve.tessellationMode == CurveTessellationMode::LinearSweptSphere)
                 {
-                    FALCOR_ASSERT(!curve.processedCurves.empty());
+                    if (!ok[i] || curve.processedCurves.empty()) { ++skipped; continue; }
                     curve.geometryID = CurveOrMeshID{ ctx.builder.addProcessedCurve(curve.processedCurves[0]) };
                 }
                 else
                 {
+                    if (!ok[i] || curve.processedMesh.staticData.empty()) { ++skipped; continue; }
                     curve.geometryID = CurveOrMeshID{ ctx.builder.addProcessedMesh(curve.processedMesh) };
                 }
             }
+            if (skipped) logWarning("Skipped {} of {} curves that failed processing.", skipped, ctx.curves.size());
 
             // Add curve vertex cache (only has positions) to scene builder.
-            for (auto& curve : ctx.curves) ctx.addCachedCurve(curve);
+            for (auto& curve : ctx.curves)
+                if (curve.geometryID.isValid()) ctx.addCachedCurve(curve);
             ctx.builder.addCachedCurves(std::move(ctx.cachedCurves));
 
             timeReport.measure("Process curves");
@@ -1294,7 +1567,11 @@ namespace Falcor
                 auto nodeId = ctx.builder.addNode(makeNode(instance.name, instance.xform, float4x4::identity(), instance.parentID));
                 const auto& curve = ctx.getCurve(instance.prim);
 
-                if (curve.tessellationMode == CurveTessellationMode::LinearSweptSphere)
+                if (!curve.geometryID.isValid())
+                {
+                    // Rejected during processing; the node stays empty.
+                }
+                else if (curve.tessellationMode == CurveTessellationMode::LinearSweptSphere)
                 {
                     ctx.builder.addCurveInstance(nodeId, CurveID{ curve.geometryID });
                 }

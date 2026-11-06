@@ -150,7 +150,9 @@ namespace Falcor
 
                     // TODO: Add support for curve instancing
                     // Now we assume each curve has only one instance.
-                    ctx.addCurveInstance(primName, prim, float4x4::identity(), ctx.nodeStack.back());
+                    // Curve vertices are baked to world space at tessellation (Falcor ignores node transforms for
+                    // curve geometry), so the instance node is parentless with an identity transform.
+                    ctx.addCurveInstance(primName, prim, float4x4::identity(), NodeID::Invalid());
                 }
                 else if (prim.IsA<UsdSkelRoot>())
                 {
