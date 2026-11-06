@@ -1006,7 +1006,23 @@ int runMain(int argc, char** argv)
     return renderer.run();
 }
 
+#if FALCOR_WINDOWS
+#include <windows.h>
+#include <cstdio>
+// Print a symbolized stack for native crashes (access violations etc.), which bypass C++ exception handling.
+static LONG WINAPI mogwaiCrashFilter(EXCEPTION_POINTERS* info)
+{
+    std::fprintf(stderr, "(Fatal) Unhandled native exception 0x%08lX at %p\n%s\n",
+        info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress, getStackTrace(0, 64).c_str());
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, char** argv)
 {
+#if FALCOR_WINDOWS
+    SetUnhandledExceptionFilter(mogwaiCrashFilter);
+#endif
     return catchAndReportAllExceptions([&]() { return runMain(argc, argv); });
 }
