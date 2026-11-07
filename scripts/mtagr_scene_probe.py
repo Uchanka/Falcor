@@ -47,20 +47,22 @@ print("PROBE_CAMERA", s.camera.position, s.camera.target, "near/far", s.camera.n
 print("PROBE_BOUNDS", s.bounds.min_point, s.bounds.max_point)
 
 m.clock.pause()
-ptime = os.environ.get("PROBE_TIME")  # seconds; if set, accumulate at this time then step one frame (1/24 s) so the
-if ptime:                             # captured motion vectors show animation between the two times
+ptime = os.environ.get("PROBE_TIME")  # seconds; if set, accumulate at this time and capture ("probe.*"), then step
+if ptime:                             # one frame (1/24 s) and capture again ("probe_step.*", motion vectors of the step)
     m.clock.time = float(ptime)
 t0 = time.time()
 for i in range(spp):
     m.renderFrame()
-if ptime:
-    m.clock.time = float(ptime) + 1.0 / 24.0
-    m.renderFrame()
-    print("PROBE_TIME", ptime, "->", m.clock.time)
 dt = time.time() - t0
 print(f"PROBE_RENDER {spp} frames in {dt:.2f} s ({dt / spp * 1000:.1f} ms/frame)")
 m.frameCapture.outputDir = out
 m.frameCapture.baseFilename = "probe"
-m.frameCapture.capture()
+m.frameCapture.capture()  # accumulated result (stepping the clock resets the accumulation)
+if ptime:
+    m.clock.time = float(ptime) + 1.0 / 24.0
+    m.renderFrame()
+    print("PROBE_TIME", ptime, "->", m.clock.time)
+    m.frameCapture.baseFilename = "probe_step"
+    m.frameCapture.capture()
 print("PROBE_DONE", out)
 exit()
