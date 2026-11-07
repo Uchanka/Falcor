@@ -26,6 +26,7 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
 #include "USDImporter.h"
+#include <cstdlib>
 #include "ImporterContext.h"
 #include "Core/Platform/OS.h"
 #include "Utils/Timing/TimeReport.h"
@@ -377,6 +378,16 @@ namespace Falcor
         }
 
         setMetadata(pStage, ctx);
+
+        // Production assets (e.g. ALab) author nearly all meshes as Catmull-Clark cages and expect the renderer to
+        // subdivide them; at level 0 the cage is merely triangulated and organic shapes look faceted.
+        // FALCOR_USD_REFINEMENT_LEVEL overrides the stage default (OpenSubdiv Bfr: (level+1)^2 quads per cage quad,
+        // points and normals on the limit surface). Per-prim refinementLevel / builder settings still take precedence.
+        if (const char* s = std::getenv("FALCOR_USD_REFINEMENT_LEVEL"))
+        {
+            ctx.defaultRefinementLevel = std::max(0, std::atoi(s));
+            logInfo("USDImporter: default subdivision refinement level = {} (FALCOR_USD_REFINEMENT_LEVEL).", ctx.defaultRefinementLevel);
+        }
 
         timeReport.measure("Load scene settings");
 

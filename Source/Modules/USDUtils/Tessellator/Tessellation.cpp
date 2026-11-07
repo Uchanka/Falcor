@@ -78,7 +78,18 @@ struct GfVec3fHash
 class MeshIndexer
 {
 public:
-    MeshIndexer(const TfToken& uvInterp) : mUVInterp(uvInterp) {}
+    /** pVertexMap (optional): sequence of output vertex indices, one per tessellated vertex in face order.
+        Empty -> recorded while deduplicating by position; non-empty -> replayed instead of deduplicating.
+        Replay keeps the output topology identical across keyframes of a vertex-animated mesh, whose
+        coincident points (and thus the position-based deduplication) differ between keyframes.
+    */
+    MeshIndexer(const TfToken& uvInterp, std::vector<int>* pVertexMap = nullptr)
+        : mUVInterp(uvInterp), mpVertexMap(pVertexMap), mReplay(pVertexMap && !pVertexMap->empty())
+    {}
+
+    bool failed() const { return mFailed; }
+    bool replayed() const { return mReplay; }
+    bool consumedAll() const { return !mReplay || mCursor == mpVertexMap->size(); }
 
     // Add a face's worth of facets to the mesh. Assumes that the facets are triangles.
     void addFacets(
@@ -102,7 +113,25 @@ public:
         {
             GfVec3f pos(positions[j + 0], positions[j + 1], positions[j + 2]);
             uint32_t idx;
-            if (mPositionSet.append(pos, idx))
+            bool isNew;
+            if (mReplay)
+            {
+                // Indices were assigned in first-seen order, so a new vertex is always the next one.
+                if (mCursor >= mpVertexMap->size() || (size_t)(*mpVertexMap)[mCursor] > mPositions.size())
+                {
+                    mFailed = true;
+                    return;
+                }
+                idx = (uint32_t)(*mpVertexMap)[mCursor++];
+                isNew = (idx == mPositions.size());
+                if (isNew) mPositions.push_back(pos);
+            }
+            else
+            {
+                isNew = mPositionSet.append(pos, idx);
+                if (mpVertexMap) mpVertexMap->push_back((int)idx);
+            }
+            if (isNew)
             {
                 // If this was the first time this position was seen, also push normals, and uvs if they are per-vertex.
                 mNormals.push_back(GfVec3f(normals[j + 0], normals[j + 1], normals[j + 2]));
@@ -141,6 +170,10 @@ public:
 
 private:
     TfToken mUVInterp;
+    std::vector<int>* mpVertexMap = nullptr;
+    bool mReplay = false;
+    size_t mCursor = 0;
+    bool mFailed = false;
     UsdIndexedVector<GfVec3f, int32_t, GfVec3fHash> mPositionSet;
     VtIntArray mIndices;
     VtVec3fArray mPositions;
@@ -330,7 +363,8 @@ UsdMeshData tessellate(
     const pxr::UsdGeomMesh& geomMesh,
     const UsdMeshData& baseMesh,
     uint32_t maxRefinementLevel,
-    pxr::VtIntArray& coarseFaceIndices
+    pxr::VtIntArray& coarseFaceIndices,
+    std::vector<int>* pVertexMap
 )
 {
     if (baseMesh.points.size() == 0 || baseMesh.topology.getNumFaces() == 0 || baseMesh.topology.faceIndices.size() == 0)
@@ -388,7 +422,7 @@ UsdMeshData tessellate(
 
     if (baseMesh.normals.size() > 0)
     {
-        logWarning("Ignoring authored normals on subdivided mesh '{}'.", geomMesh.GetPath().GetString());
+        logDebug("Ignoring authored normals on subdivided mesh '{}'.", geomMesh.GetPath().GetString());
     }
 
     OpenSubdiv::Sdc::Options options;
@@ -453,7 +487,7 @@ UsdMeshData tessellate(
     // the subdivision process, as per the USD spec. As such, any authored normals are ignored.
     // Further, we do not need to handle e.g., face-varying or uniform normals here.
 
-    MeshIndexer meshIndexer(uvInterp);
+    MeshIndexer meshIndexer(uvInterp, pVertexMap);
 
     const uint32_t faceCount = surfaceFactory.GetNumFaces();
 
@@ -547,11 +581,51 @@ UsdMeshData tessellate(
         outFacets.resize(facetCount * 3);
         tessPattern.GetFacets(outFacets.data());
 
+        // Degenerate partials (du x dv ~ 0, e.g. at collapsed cage points) give NaN normals; use the area-weighted
+        // normal of the adjacent tessellated facets instead.
+        {
+            bool anyBad = false;
+            for (int i = 0; i < outCoordCount * 3; ++i)
+                if (!std::isfinite(outNormals[i])) { anyBad = true; break; }
+            if (anyBad)
+            {
+                std::vector<float3> acc(outCoordCount, float3(0.f));
+                for (int t = 0; t < facetCount; ++t)
+                {
+                    const int a = outFacets[3 * t + 0], b = outFacets[3 * t + 1], c = outFacets[3 * t + 2];
+                    const float3 pa(outPos[3 * a], outPos[3 * a + 1], outPos[3 * a + 2]);
+                    const float3 pb(outPos[3 * b], outPos[3 * b + 1], outPos[3 * b + 2]);
+                    const float3 pc(outPos[3 * c], outPos[3 * c + 1], outPos[3 * c + 2]);
+                    const float3 n = cross(pb - pa, pc - pa);
+                    acc[a] += n; acc[b] += n; acc[c] += n;
+                }
+                for (int i = 0; i < outCoordCount; ++i)
+                {
+                    float* n = &outNormals[3 * i];
+                    if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) continue;
+                    const float len = length(acc[i]);
+                    const float3 m = (len > 0.f && std::isfinite(len)) ? acc[i] / len : float3(0.f, 0.f, 1.f);
+                    n[0] = m.x; n[1] = m.y; n[2] = m.z;
+                }
+            }
+        }
+
         meshIndexer.addFacets(outFacets, outPos, outNormals, outUV);
+        if (meshIndexer.failed())
+        {
+            logWarning("Subdivided keyframe of mesh '{}' does not match the topology of its first keyframe.", geomMesh.GetPath().GetString());
+            return UsdMeshData();
+        }
 
         // Append the index of each facet's originating coarse face, f.
         for (int i = 0; i < facetCount; ++i)
             coarseFaceIndices.push_back(f);
+    }
+
+    if (pVertexMap && meshIndexer.replayed() && !meshIndexer.consumedAll())
+    {
+        logWarning("Subdivided keyframe of mesh '{}' does not match the topology of its first keyframe.", geomMesh.GetPath().GetString());
+        return UsdMeshData();
     }
 
     UsdMeshData tessellatedMesh;

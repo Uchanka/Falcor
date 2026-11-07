@@ -247,7 +247,7 @@ namespace Falcor
         }
 
         // Convert a UsdGeomMesh, and any GeomSubsets, into a MeshGeomData
-        bool convertMeshGeomData(const UsdGeomMesh& usdMesh, const UsdTimeCode& timeCode, ImporterContext& ctx, MeshGeomData& geomOut)
+        bool convertMeshGeomData(const UsdGeomMesh& usdMesh, const UsdTimeCode& timeCode, ImporterContext& ctx, MeshGeomData& geomOut, std::vector<int>* pSubdivVertexMap = nullptr)
         {
             std::string meshName = usdMesh.GetPath().GetString();
 
@@ -310,6 +310,19 @@ namespace Falcor
                 }
                 // Get override from builder settings, if any.
                 level = ctx.builder.getSettings().getAttribute(meshName, "refinementLevel", level);
+
+                // Per-mesh triangle cap (FALCOR_USD_REFINEMENT_MAX_TRIS, default 50000; 0 = no cap): lower the level until
+                // the refined mesh (about 2 (level+1)^2 triangles per cage face) fits. Coarse cages (organic props) get the
+                // full level, already-dense meshes stay near their cage, and the scene total stays bounded.
+                static const size_t kMaxRefinedTris = []() {
+                    const char* s = std::getenv("FALCOR_USD_REFINEMENT_MAX_TRIS");
+                    return s ? (size_t)std::max(0ll, std::atoll(s)) : (size_t)50000;
+                }();
+                if (kMaxRefinedTris > 0)
+                {
+                    const size_t cageFaces = baseMesh.topology.faceCounts.size();
+                    while (level > 0 && 2 * size_t(level + 1) * size_t(level + 1) * cageFaces > kMaxRefinedTris) --level;
+                }
             }
 
             // Get texture coordinates, if any.
@@ -354,7 +367,7 @@ namespace Falcor
             }
 
             VtIntArray coarseFaceIndices;
-            UsdMeshData tessellatedMesh = tessellate(usdMesh, baseMesh, level, coarseFaceIndices);
+            UsdMeshData tessellatedMesh = tessellate(usdMesh, baseMesh, level, coarseFaceIndices, pSubdivVertexMap);
             if (tessellatedMesh.points.size() == 0) return false;
 
             VtVec3iArray triangleIndices = tessellatedMesh.topology.getTriangleIndices();
@@ -952,7 +965,9 @@ namespace Falcor
 
             if (mesh.prim.IsA<UsdGeomMesh>())
             {
-                if (!convertMeshGeomData(UsdGeomMesh(mesh.prim), UsdTimeCode(mesh.timeSamples[0]), ctx, geomData))
+                // Vertex-animated meshes record the subdivision vertex map here; keyframes replay it (see tessellate()).
+                std::vector<int>* pVertexMap = isTimeSampled(UsdGeomPointBased(mesh.prim)) ? &mesh.subdivVertexMap : nullptr;
+                if (!convertMeshGeomData(UsdGeomMesh(mesh.prim), UsdTimeCode(mesh.timeSamples[0]), ctx, geomData, pVertexMap))
                 {
                     return false;
                 }
@@ -1000,7 +1015,9 @@ namespace Falcor
             {
                 UsdGeomMesh geomMesh(mesh.prim);
 
-                if (!convertMeshGeomData(geomMesh, UsdTimeCode(mesh.timeSamples[sampleIdx]), ctx, geomData))
+                // Replay only (read-only, keyframes run in parallel); empty when the mesh was not subdivided.
+                std::vector<int>* pVertexMap = mesh.subdivVertexMap.empty() ? nullptr : &mesh.subdivVertexMap;
+                if (!convertMeshGeomData(geomMesh, UsdTimeCode(mesh.timeSamples[sampleIdx]), ctx, geomData, pVertexMap))
                 {
                     return false;
                 }

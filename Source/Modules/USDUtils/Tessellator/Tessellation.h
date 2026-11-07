@@ -87,12 +87,15 @@ struct UsdMeshData
  * @param[in] baseMesh Base mesh to tessellate.
  * @param[in] maxRefinementLevel Maximum subdivision refinement level. Zero indicates no subdivision.
  * @param[out] coarseFaceIndices Index of base face from which each output triangle derives.
+ * @param[in,out] pVertexMap Optional (subdivision only). If empty, receives the vertex deduplication map; if non-empty, the
+ *                map is replayed so that every keyframe of a vertex-animated mesh gets the same output topology.
  * @return UsdMeshData containing tessellated results; points will be zero-length on failure.
  */
 UsdMeshData tessellate(
     const pxr::UsdGeomMesh& geomMesh,
     const UsdMeshData& baseMesh,
     uint32_t maxRefinementLevel,
-    pxr::VtIntArray& coarseFaceIndices
+    pxr::VtIntArray& coarseFaceIndices,
+    std::vector<int>* pVertexMap = nullptr
 );
 } // namespace Falcor

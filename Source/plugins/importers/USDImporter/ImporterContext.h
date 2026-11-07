@@ -114,6 +114,7 @@ namespace Falcor
         std::vector<CachedMesh> cachedMeshes;       ///< Keyframe data for vertex-animated meshes per processed mesh
         std::vector<MeshID> meshIDs;                ///< List of scene builder mesh IDs.
         MeshAttributeIndicesList attributeIndices;  ///< For time-sampled meshes, list of attribute indices describing how mesh was processed
+        std::vector<int> subdivVertexMap;           ///< For subdivided time-sampled meshes, vertex dedup map of the first keyframe (replayed for the others)
     };
 
     /** Represents a curvePrim in the USD scene.
