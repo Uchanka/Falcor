@@ -66,6 +66,7 @@ BEGIN_DISABLE_USD_WARNINGS
 #include <pxr/usd/usdLux/domeLight.h>
 #include <pxr/usd/usdLux/rectLight.h>
 #include <pxr/usd/usdLux/sphereLight.h>
+#include <pxr/usd/usdLux/cylinderLight.h>
 #include <pxr/usd/usdLux/diskLight.h>
 #include <pxr/usd/usdLux/blackbody.h>
 END_DISABLE_USD_WARNINGS
@@ -1773,6 +1774,37 @@ namespace Falcor
         pLight->setScaling(float3(radius, radius, radius));
 
         addLight(lightPrim, pLight, nodeStack.back());
+    }
+
+    // UsdLuxCylinderLight: Falcor has no analytic cylinder light, so emit from a chain of sphere lights along the
+    // cylinder's local X axis (UsdLux: centered at the origin, length along X, emits from the side, not the caps).
+    // N spheres spaced length/N apart with radius sqrt(r * L / (2N)) have the same total area as the cylinder's side
+    // (2 pi r L), so with the same radiance the emitted power matches; N = round(L / 2r) keeps them about as wide
+    // as the tube. Like other UsdLux lights here, 'normalize' is not applied.
+    void ImporterContext::createCylinderLight(const UsdPrim& lightPrim)
+    {
+        UsdLuxCylinderLight cylinderLight(lightPrim);
+
+        const float3 intensity = getLightIntensity(cylinderLight, lightPrim);
+        const float radius = std::max(getAuthoredAttribute(cylinderLight.GetRadiusAttr(), lightPrim.GetAttribute(TfToken("radius")), 0.5f), 1e-6f);
+        const float length = std::max(getAuthoredAttribute(cylinderLight.GetLengthAttr(), lightPrim.GetAttribute(TfToken("length")), 1.f), 0.f);
+
+        const uint32_t count = length > 0.f ? std::clamp<uint32_t>(uint32_t(std::lround(length / (2.f * radius))), 1u, 64u) : 1u;
+        const float sphereRadius = length > 0.f ? std::sqrt(radius * length / (2.f * float(count))) : radius;
+
+        const NodeID parent = nodeStack.back();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const float x = length * ((float(i) + 0.5f) / float(count) - 0.5f);
+            const std::string name = lightPrim.GetName().GetString() + (count > 1 ? "_" + std::to_string(i) : std::string());
+            const NodeID offsetNode = builder.addNode(makeNode(name + "_offset", math::matrixFromTranslation(float3(x, 0.f, 0.f)), float4x4::identity(), parent));
+
+            ref<SphereLight> pLight = SphereLight::create(name);
+            pLight->setIntensity(intensity);
+            pLight->setScaling(float3(sphereRadius));
+            addLight(lightPrim, pLight, offsetNode);
+        }
+        logDebug("Cylinder light '{}' (r={}, L={}) -> {} sphere lights of radius {}.", lightPrim.GetPath().GetString(), radius, length, count, sphereRadius);
     }
 
     void ImporterContext::createDiskLight(const UsdPrim& lightPrim)

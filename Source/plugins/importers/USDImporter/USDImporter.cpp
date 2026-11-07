@@ -49,6 +49,7 @@ BEGIN_DISABLE_USD_WARNINGS
 #include <pxr/usd/usdLux/distantLight.h>
 #include <pxr/usd/usdLux/domeLight.h>
 #include <pxr/usd/usdLux/rectLight.h>
+#include <pxr/usd/usdLux/cylinderLight.h>
 #include <pxr/usd/usdLux/sphereLight.h>
 #include <pxr/usd/usdLux/diskLight.h>
 #include <pxr/usd/usdGeom/basisCurves.h>
@@ -173,6 +174,11 @@ namespace Falcor
                 {
                     logDebug("Processing sphere light '{}'.", primName);
                     ctx.createSphereLight(prim);
+                }
+                else if (prim.IsA<UsdLuxCylinderLight>())
+                {
+                    logDebug("Processing cylinder light '{}'.", primName);
+                    ctx.createCylinderLight(prim);
                 }
                 else if (prim.IsA<UsdLuxDiskLight>())
                 {

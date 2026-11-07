@@ -295,6 +295,7 @@ namespace Falcor
         void createDistantLight(const UsdPrim& lightPrim);
         void createRectLight(const UsdPrim& lightPrim);
         void createSphereLight(const UsdPrim& lightPrim);
+        void createCylinderLight(const UsdPrim& lightPrim);
         void createDiskLight(const UsdPrim& lightPrim);
         void createMeshedDiskLight(const UsdPrim& lightPrim);
         bool createCamera(const UsdPrim& cameraPrim);
